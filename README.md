@@ -3,20 +3,4 @@ MiniBit: Implementação de um Sistema de Compartilhamento Cooperativo de Arquiv
 
 📁 Estrutura de Diretórios
 
-minibit/
-├── tracker/
-│ └── tracker.py
-├── peer/
-│ ├── peer.py
-│ ├── block_manager.py
-│ ├── peer_connection.py
-│ └── unchoke_manager.py
-├── common/
-│ ├── protocol.py
-│ └── utils.py
-├── scripts/
-│ ├── start_tracker.py
-│ └── start_peer.py
-├── data/
-│ └── shared_file.txt
-└── README.md
+<img width="198" alt="Captura de Tela 2025-06-09 às 22 30 46" src="https://github.com/user-attachments/assets/8ee0000a-8db1-455f-bcd7-ff5b0995e8ec" />

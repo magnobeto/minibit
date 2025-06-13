@@ -1,536 +1,817 @@
-import socket
-import threading
+import os
 import time
+import socket
 import random
 import logging
-from typing import Set, Dict, List, Optional, Tuple, Any
+import threading
+import uuid
+from typing import Dict, List, Set, Tuple, Optional, Any
+
+from block_manager import BlockManager
+from peer_connection import PeerConnection
+from unchoke_manager import UnchokeManager
 
 class Peer:
     """
-    Implementa um peer na rede MiniBit.
-    
-    Responsável por:
-    - Gerenciar conexões com outros peers
-    - Solicitar e compartilhar blocos de arquivo
-    - Implementar estratégias de rarest first e tit-for-tat
-    - Manter registros de peers conectados e desbloqueados
+    Implementação do nó participante (peer) de uma rede P2P BitTorrent-like.
+    Responsável pelo download/upload de blocos e pela comunicação com outros peers.
     """
     
-    def __init__(self, peer_id: str, tracker_address: Tuple[str, int]):
+    # Constantes
+    MAX_CONNECTIONS = 10
+    BLOCK_REQUEST_INTERVAL = 0.5  # segundos
+    STATUS_UPDATE_INTERVAL = 5.0  # segundos
+    
+    def __init__(self, listen_port: int, tracker_address: Tuple[str, int], 
+                 download_dir: str = "downloads"):
         """
-        Inicializa um peer com identificador único e endereço do tracker.
+        Inicializa um novo peer na rede.
+        
+        Args:
+            listen_port: Porta para aceitar conexões de outros peers
+            tracker_address: Endereço do tracker (host, porta)
+            download_dir: Diretório para salvar os arquivos baixados
         """
-        self.peer_id = peer_id
+        # Identificador único para este peer
+        self.id = str(uuid.uuid4())[:8]
+        self.listen_port = listen_port
         self.tracker_address = tracker_address
+        self.download_dir = download_dir
+        
+        # Gerenciadores de componentes
         self.block_manager = BlockManager()
-        self.unchoke_manager = UnchokeManager(self)
-        self.peers = set()  # Conjunto de peers conhecidos
+        self.unchoke_manager = UnchokeManager()
         
-        # Valores de configuração
-        self.port = random.randint(10000, 60000)
-        self.host = "127.0.0.1"  # IP local para simulação
-        
-        # Controle de conexão
+        # Estado interno
         self.running = False
-        self.server_socket = None
-        self.peer_connections = {}  # Mapeia peer_id para conexões
-        self.file_completed = False
+        self.completed = False
+        self.peers: Dict[str, Dict[str, Any]] = {}  # Informações sobre peers conhecidos
+        self.connections: Dict[str, PeerConnection] = {}  # Conexões ativas
         
         # Threads
-        self.server_thread = None
-        self.unchoke_thread = None
-        self.tracker_update_thread = None
+        self.server_thread: Optional[threading.Thread] = None
+        self.client_thread: Optional[threading.Thread] = None
+        self.tracker_thread: Optional[threading.Thread] = None
         
-        # Locks
+        # Locks para acesso thread-safe
         self.peers_lock = threading.Lock()
-        self.connections_lock = threading.Lock()
+        self.connection_lock = threading.Lock()
         
         # Configuração de logging
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(f"Peer-{peer_id}")
-    
-    def join_network(self):
-        """
-        Registra o peer no tracker e inicia o processo de conexão à rede.
-        """
-        self.logger.info(f"Peer {self.peer_id} iniciando conexão com a rede")
+        self.logger = self._setup_logger()
         
-        # Inicializa conexão com o tracker
+        # Garantir que o diretório de downloads existe
+        os.makedirs(download_dir, exist_ok=True)
+    
+    def _setup_logger(self) -> logging.Logger:
+        """
+        Configura o logger para o peer.
+        
+        Returns:
+            Instância configurada do logger
+        """
+        logger = logging.getLogger(f"Peer-{self.id}")
+        logger.setLevel(logging.INFO)
+        
+        # Evitar duplicação de handlers
+        if not logger.handlers:
+            # Handler para saída no console
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(
+                logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            )
+            logger.addHandler(console_handler)
+            
+            # Handler para saída em arquivo
+            file_handler = logging.FileHandler(f"peer-{self.id}.log")
+            file_handler.setFormatter(
+                logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+            )
+            logger.addHandler(file_handler)
+        
+        return logger
+    
+    def start(self, torrent_info: Dict[str, Any] = None) -> bool:
+        """
+        Inicia o peer, conectando ao tracker e começando a servir/baixar conteúdo.
+        
+        Args:
+            torrent_info: Informações sobre o torrent a ser baixado
+                         (None se apenas for iniciar o peer)
+        
+        Returns:
+            True se o peer foi iniciado com sucesso, False caso contrário
+        """
+        if self.running:
+            self.logger.warning("Peer já está em execução.")
+            return False
+        
         try:
-            # Cria socket para comunicar com o tracker
-            tracker_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            tracker_socket.connect(self.tracker_address)
+            self.running = True
             
-            # Prepara mensagem de registro
-            blocks = self.block_manager.get_blocks()
-            payload = {
-                "peer_id": self.peer_id,
-                "ip": self.host,
-                "port": self.port,
-                "blocks": list(blocks)
-            }
+            # Iniciar o servidor para aceitar conexões
+            self.server_thread = threading.Thread(target=self._run_server)
+            self.server_thread.daemon = True
+            self.server_thread.start()
             
-            # Envia registro para o tracker
-            message = Protocol.create_message(Protocol.REGISTER, payload)
-            tracker_socket.sendall(message)
+            # Se temos informações do torrent, iniciar o download
+            if torrent_info:
+                success = self._initialize_download(torrent_info)
+                if not success:
+                    self.logger.error("Falha ao inicializar download.")
+                    self.stop()
+                    return False
             
-            # Recebe resposta do tracker (lista de peers)
-            response_type, response_payload = Protocol.read_message_from_stream(tracker_socket.makefile(mode='rb'))
-            tracker_socket.close()
+            # Iniciar thread para comunicação com o tracker
+            self.tracker_thread = threading.Thread(target=self._tracker_communication_loop)
+            self.tracker_thread.daemon = True
+            self.tracker_thread.start()
             
-            if response_type != Protocol.PEER_LIST:
-                self.logger.error("Resposta inesperada do tracker")
-                return False
+            # Iniciar thread para gerenciamento de conexões e downloads
+            self.client_thread = threading.Thread(target=self._client_loop)
+            self.client_thread.daemon = True
+            self.client_thread.start()
             
-            # Processa lista de peers recebida
-            new_peers = response_payload.get("peers", [])
-            self.logger.info(f"Recebidos {len(new_peers)} peers do tracker")
-            
-            # Adiciona peers à lista local
-            with self.peers_lock:
-                for peer_data in new_peers:
-                    peer_id = peer_data[0]
-                    peer_ip = peer_data[1]
-                    peer_port = peer_data[2]
-                    self.peers.add((peer_id, peer_ip, peer_port))
-            
+            self.logger.info(f"Peer iniciado com sucesso. ID: {self.id}, Porta: {self.listen_port}")
             return True
             
         except Exception as e:
-            self.logger.error(f"Erro ao conectar ao tracker: {str(e)}")
+            self.logger.error(f"Erro ao iniciar peer: {str(e)}")
+            self.running = False
             return False
     
-    def run(self):
+    def stop(self) -> None:
         """
-        Inicia o loop principal do peer, gerenciando conexões e troca de blocos.
+        Para todas as operações do peer e fecha conexões.
         """
-        self.running = True
-        
-        # Inicia servidor para aceitar conexões
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen(5)
-        self.server_socket.settimeout(1)  # Timeout para permitir encerramento controlado
-        
-        # Cria threads
-        self.server_thread = threading.Thread(target=self._accept_connections)
-        self.unchoke_thread = threading.Thread(target=self._run_unchoke_process)
-        self.tracker_update_thread = threading.Thread(target=self._update_tracker_periodically)
-        
-        # Inicia threads
-        self.server_thread.start()
-        self.unchoke_thread.start()
-        self.tracker_update_thread.start()
-        
-        # Conecta aos peers conhecidos
-        self._connect_to_peers()
-        
-        # Enquanto estiver em execução, faz requisições de blocos
-        while self.running and not self.file_completed:
-            try:
-                # Verifica se já tem todos os blocos
-                if self.block_manager.is_complete():
-                    self.logger.info("Arquivo completo! Preparando para encerramento...")
-                    self.file_completed = True
-                    break
-                
-                # Seleciona próximo bloco para solicitar usando rarest first
-                next_block = self.block_manager.get_rarest_needed_block()
-                if next_block is None:
-                    time.sleep(1)  # Espera antes de tentar novamente
-                    continue
-                
-                # Encontra peer desbloqueado que possui esse bloco
-                peer_id = self.unchoke_manager.get_peer_with_block(next_block)
-                if not peer_id:
-                    time.sleep(0.5)  # Espera antes de tentar novamente
-                    continue
-                
-                # Solicita bloco ao peer
-                self._request_block(peer_id, next_block)
-                
-                # Pequena pausa para controlar a taxa de solicitações
-                time.sleep(0.1)
-                
-            except Exception as e:
-                self.logger.error(f"Erro no loop principal: {str(e)}")
-                time.sleep(1)
-        
-        if self.file_completed:
-            self.shutdown()
-    
-    def shutdown(self):
-        """
-        Reconstrói o arquivo completo e encerra ordenadamente o peer.
-        """
-        self.logger.info("Iniciando processo de desligamento")
+        if not self.running:
+            return
+            
+        self.logger.info("Encerrando peer...")
         self.running = False
         
-        # Espera pelas threads
-        if self.server_thread:
-            self.server_thread.join(timeout=2)
-        if self.unchoke_thread:
-            self.unchoke_thread.join(timeout=2)
-        if self.tracker_update_thread:
-            self.tracker_update_thread.join(timeout=2)
+        # Fechar todas as conexões
+        with self.connection_lock:
+            for conn in list(self.connections.values()):
+                conn.close()
+            self.connections.clear()
         
-        # Fecha o socket do servidor
-        if self.server_socket:
-            self.server_socket.close()
+        # Aguardar threads finalizarem (com timeout)
+        if self.server_thread and self.server_thread.is_alive():
+            self.server_thread.join(timeout=2.0)
         
-        # Fecha as conexões com peers
-        with self.connections_lock:
-            for conn in self.peer_connections.values():
-                try:
-                    conn['socket'].close()
-                except:
-                    pass
-            self.peer_connections.clear()
-        
-        # Reconstrói o arquivo se estiver completo
-        if self.block_manager.is_complete():
-            try:
-                output_file = f"reconstructed_{self.peer_id}.txt"
-                self.block_manager.reconstruct_file(output_file)
-                self.logger.info(f"Arquivo reconstruído com sucesso: {output_file}")
-            except Exception as e:
-                self.logger.error(f"Erro ao reconstruir arquivo: {str(e)}")
-        
-        self.logger.info(f"Peer {self.peer_id} encerrado")
+        if self.client_thread and self.client_thread.is_alive():
+            self.client_thread.join(timeout=2.0)
+            
+        if self.tracker_thread and self.tracker_thread.is_alive():
+            self.tracker_thread.join(timeout=2.0)
+            
+        self.logger.info("Peer encerrado.")
     
-    def _accept_connections(self):
+    def add_file(self, file_path: str, block_size: int = 1024*16) -> Dict[str, Any]:
         """
-        Thread que aceita conexões de entrada de outros peers.
-        """
-        self.logger.info(f"Servidor iniciado em {self.host}:{self.port}")
+        Adiciona um arquivo para compartilhamento na rede.
         
-        while self.running:
-            try:
-                client_socket, addr = self.server_socket.accept()
-                client_thread = threading.Thread(target=self._handle_peer_connection, args=(client_socket, addr))
-                client_thread.start()
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self.running:
-                    self.logger.error(f"Erro ao aceitar conexão: {str(e)}")
-    
-    def _handle_peer_connection(self, client_socket, addr):
-        """
-        Gerencia uma conexão de entrada de outro peer.
+        Args:
+            file_path: Caminho do arquivo a ser compartilhado
+            block_size: Tamanho dos blocos em bytes
+            
+        Returns:
+            Informações do torrent gerado ou None se houver erro
         """
         try:
-            # Configura o socket
-            client_socket.settimeout(10)
-            client_file = client_socket.makefile(mode='rb')
+            file_name = os.path.basename(file_path)
+            file_size = os.path.getsize(file_path)
             
-            # Espera pela mensagem inicial
-            msg_type, payload = Protocol.read_message_from_stream(client_file)
+            # Calcular número de blocos
+            num_blocks = (file_size + block_size - 1) // block_size
             
-            if msg_type == Protocol.REGISTER:
-                peer_id = payload.get("peer_id")
-                peer_blocks = set(payload.get("blocks", []))
-                
-                # Registra a conexão
-                with self.connections_lock:
-                    self.peer_connections[peer_id] = {
-                        'socket': client_socket,
-                        'file': client_file,
-                        'addr': addr,
-                        'blocks': peer_blocks,
-                        'last_activity': time.time()
-                    }
-                
-                self.logger.info(f"Conexão de entrada estabelecida com peer {peer_id}")
-                
-                # Responde com os blocos que este peer possui
-                response_payload = {
-                    "peer_id": self.peer_id,
-                    "blocks": list(self.block_manager.get_blocks())
-                }
-                response = Protocol.create_message(Protocol.HAVE_BLOCKS, response_payload)
-                client_socket.sendall(response)
-                
-                # Atualiza o gerenciador de unchoke
-                self.unchoke_manager.add_peer(peer_id, peer_blocks)
-                
-                # Continua processando mensagens deste peer
-                self._process_peer_messages(peer_id, client_socket, client_file)
-            else:
-                self.logger.warning(f"Mensagem inicial inesperada: {msg_type}")
-                client_socket.close()
-                
+            # Gerar IDs dos blocos
+            block_ids = [f"{file_name}_{i}" for i in range(num_blocks)]
+            
+            # Inicializar o block manager com todos os blocos
+            self.block_manager.load_initial_blocks(block_ids, len(block_ids))
+            
+            # Ler arquivo e adicionar blocos
+            with open(file_path, 'rb') as f:
+                for i, block_id in enumerate(block_ids):
+                    data = f.read(block_size)
+                    if not data:
+                        break
+                    self.block_manager.add_block(block_id, data)
+            
+            torrent_info = {
+                "file_name": file_name,
+                "file_size": file_size,
+                "block_size": block_size,
+                "num_blocks": num_blocks,
+                "block_ids": block_ids
+            }
+            
+            self.logger.info(f"Arquivo adicionado: {file_name}, {num_blocks} blocos")
+            
+            # Se o peer já está rodando, atualizar o tracker
+            if self.running:
+                self._update_tracker(torrent_info)
+            
+            return torrent_info
+            
         except Exception as e:
-            self.logger.error(f"Erro ao tratar conexão do peer {addr}: {str(e)}")
+            self.logger.error(f"Erro ao adicionar arquivo: {str(e)}")
+            return None
+    
+    def download_file(self, torrent_info: Dict[str, Any]) -> bool:
+        """
+        Inicia o download de um arquivo usando as informações do torrent.
+        
+        Args:
+            torrent_info: Informações do torrent
+            
+        Returns:
+            True se o download foi iniciado com sucesso, False caso contrário
+        """
+        if not self.running:
+            self.logger.error("Peer não está em execução.")
+            return self.start(torrent_info)
+        
+        return self._initialize_download(torrent_info)
+    
+    def get_download_status(self) -> Dict[str, Any]:
+        """
+        Retorna o status atual do download.
+        
+        Returns:
+            Dicionário com informações sobre o progresso do download
+        """
+        if not hasattr(self, 'torrent_info') or not self.torrent_info:
+            return {"status": "idle", "progress": 0}
+        
+        total_blocks = len(self.torrent_info["block_ids"])
+        downloaded_blocks = len(self.block_manager.get_blocks())
+        
+        progress = (downloaded_blocks / total_blocks) * 100 if total_blocks > 0 else 0
+        
+        return {
+            "status": "completed" if self.completed else "downloading",
+            "file_name": self.torrent_info.get("file_name", "unknown"),
+            "progress": progress,
+            "downloaded_blocks": downloaded_blocks,
+            "total_blocks": total_blocks,
+            "active_connections": len(self.connections),
+            "known_peers": len(self.peers)
+        }
+    
+    def _initialize_download(self, torrent_info: Dict[str, Any]) -> bool:
+        """
+        Inicializa o processo de download com base nas informações do torrent.
+        
+        Args:
+            torrent_info: Informações do torrent
+            
+        Returns:
+            True se a inicialização foi bem-sucedida, False caso contrário
+        """
+        try:
+            self.torrent_info = torrent_info
+            self.completed = False
+            
+            # Configurar o gerenciador de blocos
+            block_ids = torrent_info["block_ids"]
+            self.block_manager = BlockManager()
+            self.block_manager.load_initial_blocks(block_ids)
+            
+            # Contatar o tracker para obter a lista inicial de peers
+            success = self._update_tracker(torrent_info)
+            if not success:
+                self.logger.error("Falha ao contatar o tracker.")
+                return False
+                
+            self.logger.info(f"Download iniciado: {torrent_info['file_name']}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Erro ao inicializar download: {str(e)}")
+            return False
+    
+    def _run_server(self) -> None:
+        """
+        Thread que aceita conexões de outros peers.
+        """
+        try:
+            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server_socket.bind(('', self.listen_port))
+            server_socket.settimeout(1.0)  # Timeout para permitir verificação de self.running
+            server_socket.listen(5)
+            
+            self.logger.info(f"Servidor iniciado na porta {self.listen_port}")
+            
+            while self.running:
+                try:
+                    client_socket, address = server_socket.accept()
+                    client_thread = threading.Thread(
+                        target=self._handle_incoming_connection,
+                        args=(client_socket, address)
+                    )
+                    client_thread.daemon = True
+                    client_thread.start()
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    if self.running:
+                        self.logger.error(f"Erro no servidor: {str(e)}")
+            
+        except Exception as e:
+            self.logger.error(f"Erro fatal no servidor: {str(e)}")
+        finally:
             try:
-                client_socket.close()
+                server_socket.close()
             except:
                 pass
     
-    def _process_peer_messages(self, peer_id, socket, file):
+    def _handle_incoming_connection(self, client_socket: socket.socket, address: Tuple[str, int]) -> None:
         """
-        Processa mensagens de um peer conectado.
+        Processa uma nova conexão de entrada.
+        
+        Args:
+            client_socket: Socket do cliente conectado
+            address: Endereço do cliente (host, porta)
+        """
+        peer_conn = None
+        try:
+            self.logger.info(f"Nova conexão de {address}")
+            
+            # Criar objeto de conexão
+            peer_addr = (address[0], address[1])
+            peer_conn = PeerConnection(peer_addr)
+            peer_conn.socket = client_socket
+            peer_conn.file_stream = client_socket.makefile(mode='rb')
+            peer_conn.connected = True
+            
+            # Receber mensagem de registro
+            msg_type, payload = peer_conn._read_message()
+            
+            if msg_type != PeerConnection.MSG_REGISTER:
+                self.logger.warning("Primeira mensagem não é registro. Fechando conexão.")
+                return
+                
+            # Extrair informações do peer
+            peer_id = payload.get("peer_id")
+            available_blocks = set(payload.get("blocks", []))
+            
+            if not peer_id:
+                self.logger.warning("ID do peer não fornecido. Fechando conexão.")
+                return
+                
+            # Responder com nossos blocos disponíveis
+            our_blocks = list(self.block_manager.get_blocks())
+            response = {
+                "peer_id": self.id,
+                "blocks": our_blocks
+            }
+            peer_conn._send_message(PeerConnection.MSG_HAVE_BLOCKS, response)
+            
+            # Registrar a conexão
+            with self.connection_lock:
+                if len(self.connections) >= self.MAX_CONNECTIONS:
+                    # Se já atingiu o limite, fecha a conexão mais antiga que não esteja unchoked
+                    oldest_conn = None
+                    oldest_time = float('inf')
+                    
+                    for pid, conn in self.connections.items():
+                        if not self.unchoke_manager.is_unchoked(pid):
+                            # Verificar tempo (usando peer_id como estimativa)
+                            if pid < oldest_time:
+                                oldest_time = pid
+                                oldest_conn = pid
+                    
+                    if oldest_conn:
+                        old_conn = self.connections.pop(oldest_conn, None)
+                        if old_conn:
+                            old_conn.close()
+                
+                self.connections[peer_id] = peer_conn
+            
+            # Registrar o peer
+            with self.peers_lock:
+                self.peers[peer_id] = {
+                    "address": peer_addr,
+                    "available_blocks": available_blocks,
+                    "last_seen": time.time()
+                }
+            
+            # Registrar no unchoke manager
+            self.unchoke_manager.register_peer(peer_id)
+            
+            # Atualizar informações de raridade no block manager
+            self.block_manager.update_rarity_info(peer_id, available_blocks)
+            
+            # Loop de processamento de mensagens
+            self._process_peer_messages(peer_conn, peer_id)
+            
+        except Exception as e:
+            self.logger.error(f"Erro no processamento da conexão de {address}: {str(e)}")
+        finally:
+            if peer_conn and peer_conn.peer_id in self.connections:
+                with self.connection_lock:
+                    self.connections.pop(peer_conn.peer_id, None)
+                peer_conn.close()
+    
+    def _process_peer_messages(self, peer_conn: PeerConnection, peer_id: str) -> None:
+        """
+        Processa mensagens recebidas de um peer conectado.
+        
+        Args:
+            peer_conn: Objeto de conexão com o peer
+            peer_id: ID do peer
+        """
+        while self.running and peer_conn.is_connected():
+            try:
+                msg_type, payload = peer_conn.read_message()
+                
+                if msg_type == PeerConnection.MSG_REQUEST_BLOCK:
+                    block_id = payload.get("block_id")
+                    
+                    # Verificar se o peer está unchoked
+                    if not self.unchoke_manager.is_unchoked(peer_id):
+                        self.logger.debug(f"Bloqueando solicitação do peer {peer_id}: choked")
+                        continue
+                    
+                    # Verificar se temos o bloco
+                    if not block_id or not self.block_manager.has_block(block_id):
+                        continue
+                        
+                    # Enviar o bloco
+                    block_data = self.block_manager.get_block_data(block_id)
+                    if block_data:
+                        peer_conn.send_block(block_id, block_data)
+                
+                elif msg_type == PeerConnection.MSG_BLOCK_DATA:
+                    block_id = payload.get("block_id")
+                    block_data = payload.get("data")
+                    
+                    if not block_id or not block_data:
+                        continue
+                        
+                    # Adicionar o bloco ao gerenciador
+                    if self.block_manager.add_block(block_id, block_data):
+                        # Registrar o download para o unchoke manager
+                        self.unchoke_manager.record_download(peer_id, len(block_data))
+                        
+                        # Verificar se o download está completo
+                        if self.block_manager.is_complete():
+                            self._handle_download_completion()
+                            
+                        # Notificar outros peers que temos este bloco
+                        self._broadcast_have_block(block_id)
+                
+                elif msg_type == PeerConnection.MSG_HAVE_BLOCKS:
+                    blocks = set(payload.get("blocks", []))
+                    
+                    # Atualizar informações do peer
+                    with self.peers_lock:
+                        if peer_id in self.peers:
+                            self.peers[peer_id]["available_blocks"] = blocks
+                            self.peers[peer_id]["last_seen"] = time.time()
+                    
+                    # Atualizar informações de raridade
+                    self.block_manager.update_rarity_info(peer_id, blocks)
+                    
+                    # Marcar como interessado se o peer tem blocos que precisamos
+                    missing_blocks = self.block_manager.get_missing_blocks()
+                    is_interested = bool(missing_blocks.intersection(blocks))
+                    self.unchoke_manager.set_peer_interested(peer_id, is_interested)
+                
+                elif msg_type == PeerConnection.MSG_CHOKE:
+                    peer_conn.set_choked_status(True)
+                    
+                elif msg_type == PeerConnection.MSG_UNCHOKE:
+                    peer_conn.set_choked_status(False)
+                
+            except Exception as e:
+                self.logger.error(f"Erro no processamento de mensagem do peer {peer_id}: {str(e)}")
+                break
+    
+    def _client_loop(self) -> None:
+        """
+        Thread principal do cliente que gerencia conexões e solicita blocos.
+        """
+        last_block_request_time = 0
+        last_status_update_time = 0
+        last_unchoke_evaluation_time = 0
+        
+        while self.running:
+            current_time = time.time()
+            
+            try:
+                # Avaliar peers para choke/unchoke periodicamente
+                if current_time - last_unchoke_evaluation_time >= 5.0:
+                    self.unchoke_manager.evaluate_peers()
+                    last_unchoke_evaluation_time = current_time
+                    
+                    # Aplicar decisões de choke/unchoke
+                    self._apply_choke_decisions()
+                
+                # Conectar a novos peers periodicamente
+                self._manage_connections()
+                
+                # Solicitar blocos periodicamente
+                if current_time - last_block_request_time >= self.BLOCK_REQUEST_INTERVAL:
+                    self._request_missing_blocks()
+                    last_block_request_time = current_time
+                
+                # Atualizar e exibir status periodicamente
+                if current_time - last_status_update_time >= self.STATUS_UPDATE_INTERVAL:
+                    self._log_status()
+                    last_status_update_time = current_time
+                
+                # Pequena pausa para evitar CPU 100%
+                time.sleep(0.05)
+                
+            except Exception as e:
+                self.logger.error(f"Erro no loop do cliente: {str(e)}")
+                time.sleep(1)
+    
+    def _tracker_communication_loop(self) -> None:
+        """
+        Thread responsável pela comunicação periódica com o tracker.
         """
         while self.running:
             try:
-                msg_type, payload = Protocol.read_message_from_stream(file)
-                if not msg_type:
-                    break
-                
-                with self.connections_lock:
-                    if peer_id in self.peer_connections:
-                        self.peer_connections[peer_id]['last_activity'] = time.time()
-                
-                # Processa mensagem de acordo com o tipo
-                if msg_type == Protocol.REQUEST_BLOCK:
-                    block_id = payload.get("block_id")
-                    self._handle_block_request(peer_id, socket, block_id)
+                if hasattr(self, 'torrent_info') and self.torrent_info:
+                    self._update_tracker(self.torrent_info)
                     
-                elif msg_type == Protocol.BLOCK_DATA:
-                    block_id = payload.get("block_id")
-                    block_data = payload.get("data")
-                    self._handle_block_data(peer_id, block_id, block_data)
-                    
-                elif msg_type == Protocol.HAVE_BLOCKS:
-                    blocks = set(payload.get("blocks", []))
-                    self._handle_have_blocks(peer_id, blocks)
-                    
-                elif msg_type == Protocol.UNCHOKE:
-                    self._handle_unchoke(peer_id)
-                    
-                elif msg_type == Protocol.CHOKE:
-                    self._handle_choke(peer_id)
-                    
+                # Atualizar a cada 30 segundos
+                for _ in range(30):
+                    if not self.running:
+                        break
+                    time.sleep(1)
+            
             except Exception as e:
-                self.logger.error(f"Erro ao processar mensagens do peer {peer_id}: {str(e)}")
-                break
-        
-        # Conexão encerrada
-        with self.connections_lock:
-            if peer_id in self.peer_connections:
-                self.logger.info(f"Conexão encerrada com peer {peer_id}")
-                self.peer_connections[peer_id]['socket'].close()
-                del self.peer_connections[peer_id]
-        
-        self.unchoke_manager.remove_peer(peer_id)
+                self.logger.error(f"Erro na comunicação com tracker: {str(e)}")
+                time.sleep(5)
     
-    def _connect_to_peers(self):
+    def _update_tracker(self, torrent_info: Dict[str, Any]) -> bool:
         """
-        Estabelece conexões com peers conhecidos.
-        """
-        with self.peers_lock:
-            peers_to_connect = list(self.peers)
+        Atualiza o tracker sobre o status do peer e obtém a lista de peers.
         
-        for peer_id, peer_ip, peer_port in peers_to_connect:
-            self._connect_to_peer(peer_id, peer_ip, peer_port)
-    
-    def _connect_to_peer(self, peer_id, peer_ip, peer_port):
+        Args:
+            torrent_info: Informações do torrent
+            
+        Returns:
+            True se a atualização foi bem-sucedida, False caso contrário
         """
-        Estabelece conexão com um peer específico.
-        """
-        with self.connections_lock:
-            if peer_id in self.peer_connections:
-                return  # Já conectado
-        
         try:
-            peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            peer_socket.settimeout(5)
-            peer_socket.connect((peer_ip, peer_port))
+            # Em uma implementação real, aqui seria uma requisição HTTP ou TCP
+            # ao tracker. Para este exemplo, simularemos uma resposta.
             
-            # Envia mensagem de registro
-            payload = {
-                "peer_id": self.peer_id,
-                "blocks": list(self.block_manager.get_blocks())
+            # Supondo que o tracker retorne uma lista de peers ativos
+            tracker_response = {
+                "peers": [
+                    {"id": f"peer_{i}", "host": "localhost", "port": 9000+i}
+                    for i in range(1, 5)
+                ]
             }
-            message = Protocol.create_message(Protocol.REGISTER, payload)
-            peer_socket.sendall(message)
             
-            # Configura socket para receber resposta
-            peer_file = peer_socket.makefile(mode='rb')
+            # Processar a lista de peers
+            for peer_info in tracker_response["peers"]:
+                peer_id = peer_info["id"]
+                peer_addr = (peer_info["host"], peer_info["port"])
+                
+                # Não adicionar a si mesmo
+                if peer_id == self.id:
+                    continue
+                
+                # Adicionar à lista de peers conhecidos
+                with self.peers_lock:
+                    if peer_id not in self.peers:
+                        self.peers[peer_id] = {
+                            "address": peer_addr,
+                            "available_blocks": set(),
+                            "last_seen": time.time()
+                        }
             
-            # Espera pela resposta
-            response_type, response_payload = Protocol.read_message_from_stream(peer_file)
-            
-            if response_type == Protocol.HAVE_BLOCKS:
-                peer_blocks = set(response_payload.get("blocks", []))
-                
-                # Registra a conexão
-                with self.connections_lock:
-                    self.peer_connections[peer_id] = {
-                        'socket': peer_socket,
-                        'file': peer_file,
-                        'addr': (peer_ip, peer_port),
-                        'blocks': peer_blocks,
-                        'last_activity': time.time()
-                    }
-                
-                self.logger.info(f"Conexão estabelecida com peer {peer_id}")
-                
-                # Atualiza gerenciador de unchoke
-                self.unchoke_manager.add_peer(peer_id, peer_blocks)
-                
-                # Inicia thread para processar mensagens desse peer
-                peer_thread = threading.Thread(target=self._process_peer_messages, 
-                                              args=(peer_id, peer_socket, peer_file))
-                peer_thread.start()
-                
-                return True
-            else:
-                self.logger.warning(f"Resposta inesperada de {peer_id}: {response_type}")
-                peer_socket.close()
-                return False
-                
-        except Exception as e:
-            self.logger.error(f"Erro ao conectar com peer {peer_id}: {str(e)}")
-            return False
-    
-    def _request_block(self, peer_id, block_id):
-        """
-        Solicita um bloco específico a um peer.
-        """
-        with self.connections_lock:
-            if peer_id not in self.peer_connections:
-                return False
-            
-            peer_socket = self.peer_connections[peer_id]['socket']
-            
-        try:
-            payload = {
-                "block_id": block_id
-            }
-            message = Protocol.create_message(Protocol.REQUEST_BLOCK, payload)
-            peer_socket.sendall(message)
             return True
             
         except Exception as e:
-            self.logger.error(f"Erro ao solicitar bloco {block_id} do peer {peer_id}: {str(e)}")
+            self.logger.error(f"Erro ao atualizar tracker: {str(e)}")
             return False
     
-    def _handle_block_request(self, peer_id, socket, block_id):
+    def _manage_connections(self) -> None:
         """
-        Processa solicitação de bloco de um peer.
+        Gerencia conexões ativas, estabelecendo novas quando necessário.
         """
-        if not self.block_manager.has_block(block_id):
-            self.logger.warning(f"Peer {peer_id} solicitou bloco {block_id} que não possuímos")
-            return
+        # Se já atingiu o limite de conexões, não fazer nada
+        with self.connection_lock:
+            if len(self.connections) >= self.MAX_CONNECTIONS:
+                return
         
-        try:
-            # Obtém dados do bloco
-            block_data = self.block_manager.get_block_data(block_id)
+        # Obter peers conhecidos que não estamos conectados
+        unconnected_peers = []
+        with self.peers_lock:
+            for peer_id, peer_info in self.peers.items():
+                with self.connection_lock:
+                    if peer_id not in self.connections:
+                        unconnected_peers.append((peer_id, peer_info["address"]))
+        
+        # Tentar conectar a novos peers
+        for peer_id, peer_addr in unconnected_peers:
+            if not self.running:
+                break
+                
+            with self.connection_lock:
+                if len(self.connections) >= self.MAX_CONNECTIONS:
+                    break
+                    
+                if peer_id in self.connections:
+                    continue
             
-            # Envia dados do bloco
-            payload = {
-                "block_id": block_id,
-                "data": block_data
-            }
-            message = Protocol.create_message(Protocol.BLOCK_DATA, payload)
-            socket.sendall(message)
+            # Tentar estabelecer conexão
+            self._connect_to_peer(peer_id, peer_addr)
+    
+    def _connect_to_peer(self, peer_id: str, peer_addr: Tuple[str, int]) -> bool:
+        """
+        Estabelece conexão com um peer específico.
+        
+        Args:
+            peer_id: ID do peer
+            peer_addr: Endereço do peer (host, porta)
+            
+        Returns:
+            True se a conexão foi estabelecida com sucesso, False caso contrário
+        """
+        try:
+            peer_conn = PeerConnection(peer_addr, peer_id)
+            
+            # Tentar conectar
+            if not peer_conn.connect():
+                return False
+                
+            # Registrar-se com o peer
+            our_blocks = list(self.block_manager.get_blocks())
+            if not peer_conn.register(self.id, our_blocks):
+                peer_conn.close()
+                return False
+            
+            # Adicionar à lista de conexões
+            with self.connection_lock:
+                self.connections[peer_id] = peer_conn
+                
+            # Iniciar thread para processar mensagens
+            client_thread = threading.Thread(
+                target=self._process_peer_messages,
+                args=(peer_conn, peer_id)
+            )
+            client_thread.daemon = True
+            client_thread.start()
+            
+            # Registrar no unchoke manager
+            self.unchoke_manager.register_peer(peer_id)
+            
+            self.logger.info(f"Conexão estabelecida com peer {peer_id}")
+            return True
             
         except Exception as e:
-            self.logger.error(f"Erro ao enviar bloco {block_id} para peer {peer_id}: {str(e)}")
+            self.logger.error(f"Erro ao conectar ao peer {peer_id}: {str(e)}")
+            return False
     
-    def _handle_block_data(self, peer_id, block_id, block_data):
+    def _request_missing_blocks(self) -> None:
         """
-        Processa dados de bloco recebidos de um peer.
+        Solicita blocos ausentes de peers conectados.
         """
-        self.logger.info(f"Recebido bloco {block_id} do peer {peer_id}")
-        
-        # Armazena o bloco
-        success = self.block_manager.add_block(block_id, block_data)
-        
-        if success:
-            # Notifica peers sobre novo bloco
-            self._notify_peers_about_new_block(block_id)
+        # Se já completou o download, não fazer nada
+        if self.completed:
+            return
             
-            # Registra que este peer foi útil (para tit-for-tat)
-            self.unchoke_manager.register_block_received(peer_id)
+        # Obter blocos ausentes
+        missing_blocks = list(self.block_manager.get_missing_blocks())
+        if not missing_blocks:
+            return
+            
+        # Obter lista de peers unchoked
+        unchoked_peers = self.unchoke_manager.get_unchoked_peers()
+        if not unchoked_peers:
+            return
+            
+        # Para cada peer não bloqueado, solicitar um bloco
+        for peer_id in unchoked_peers:
+            # Verificar se o peer está conectado
+            peer_conn = None
+            with self.connection_lock:
+                peer_conn = self.connections.get(peer_id)
+                
+            if not peer_conn or not peer_conn.is_connected() or peer_conn.is_choked():
+                continue
+                
+            # Verificar quais blocos ausentes o peer tem
+            available_blocks = set()
+            with self.peers_lock:
+                if peer_id in self.peers:
+                    available_blocks = self.peers[peer_id].get("available_blocks", set())
+            
+            # Filtrar blocos que o peer tem
+            mutual_blocks = set(missing_blocks).intersection(available_blocks)
+            if not mutual_blocks:
+                continue
+                
+            # Selecionar o bloco mais raro
+            rarest_block = self.block_manager.get_rarest_needed_block()
+            if not rarest_block or rarest_block not in mutual_blocks:
+                # Fallback para seleção aleatória
+                block_id = random.choice(list(mutual_blocks))
+            else:
+                block_id = rarest_block
+                
+            # Solicitar o bloco
+            block_data = peer_conn.request_block(block_id)
+            if block_data:
+                # Adicionar o bloco recebido
+                if self.block_manager.add_block(block_id, block_data):
+                    # Registrar o download para o unchoke manager
+                    self.unchoke_manager.record_download(peer_id, len(block_data))
+                    
+                    # Verificar se o download está completo
+                    if self.block_manager.is_complete():
+                        self._handle_download_completion()
+                        
+                    # Notificar outros peers que temos este bloco
+                    self._broadcast_have_block(block_id)
     
-    def _handle_have_blocks(self, peer_id, blocks):
+    def _apply_choke_decisions(self) -> None:
         """
-        Atualiza informação sobre blocos que um peer possui.
+        Aplica as decisões de choke/unchoke aos peers conectados.
         """
-        with self.connections_lock:
-            if peer_id in self.peer_connections:
-                self.peer_connections[peer_id]['blocks'] = blocks
+        unchoked_peers = set(self.unchoke_manager.get_unchoked_peers())
         
-        self.unchoke_manager.update_peer_blocks(peer_id, blocks)
+        # Para cada conexão, aplicar o status de choke
+        with self.connection_lock:
+            for peer_id, conn in self.connections.items():
+                should_be_unchoked = peer_id in unchoked_peers
+                is_unchoked = not conn.is_choked()
+                
+                # Se o status mudou, enviar mensagem
+                if should_be_unchoked != is_unchoked:
+                    if should_be_unchoked:
+                        conn.send_unchoke()
+                        conn.set_choked_status(False)
+                    else:
+                        conn.send_choke()
+                        conn.set_choked_status(True)
     
-    def _handle_unchoke(self, peer_id):
+    def _broadcast_have_block(self, block_id: str) -> None:
         """
-        Processa notificação de unchoke de um peer.
-        """
-        self.unchoke_manager.set_peer_choked(peer_id, False)
-    
-    def _handle_choke(self, peer_id):
-        """
-        Processa notificação de choke de um peer.
-        """
-        self.unchoke_manager.set_peer_choked(peer_id, True)
-    
-    def _run_unchoke_process(self):
-        """
-        Thread que executa periodicamente o algoritmo de unchoke.
-        """
-        while self.running:
-            try:
-                # Executa lógica de unchoke
-                self.unchoke_manager.run_unchoke_round()
-                
-                # Espera para próxima rodada
-                time.sleep(10)  # 10 segundos entre rodadas
-            except Exception as e:
-                self.logger.error(f"Erro no processo de unchoke: {str(e)}")
-                time.sleep(2)
-    
-    def _update_tracker_periodically(self):
-        """
-        Thread que atualiza o tracker periodicamente com os blocos possuídos.
-        """
-        while self.running:
-            try:
-                # Conecta ao tracker para atualizar
-                tracker_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                tracker_socket.connect(self.tracker_address)
-                
-                # Prepara mensagem com blocos atuais
-                blocks = self.block_manager.get_blocks()
-                payload = {
-                    "peer_id": self.peer_id,
-                    "ip": self.host,
-                    "port": self.port,
-                    "blocks": list(blocks)
-                }
-                
-                # Envia atualização
-                message = Protocol.create_message(Protocol.REGISTER, payload)
-                tracker_socket.sendall(message)
-                
-                # Processa resposta mas não atualiza peers
-                file = tracker_socket.makefile(mode='rb')
-                Protocol.read_message_from_stream(file)
-                tracker_socket.close()
-                
-                # Espera para próxima atualização
-                time.sleep(30)  # 30 segundos entre atualizações
-                
-            except Exception as e:
-                self.logger.error(f"Erro ao atualizar tracker: {str(e)}")
-                time.sleep(10)
-    
-    def _notify_peers_about_new_block(self, block_id):
-        """
-        Notifica todos os peers conectados sobre um novo bloco adquirido.
-        """
-        with self.connections_lock:
-            peers = list(self.peer_connections.items())
+        Notifica todos os peers conectados sobre um novo bloco disponível.
         
-        for peer_id, connection in peers:
-            try:
-                payload = {
-                    "blocks": list(self.block_manager.get_blocks())
-                }
-                message = Protocol.create_message(Protocol.HAVE_BLOCKS, payload)
-                connection['socket'].sendall(message)
-                
-            except Exception as e:
-                self.logger.error(f"Erro ao notificar peer {peer_id} sobre novo bloco: {str(e)}")
+        Args:
+            block_id: ID do bloco adicionado
+        """
+        our_blocks = list(self.block_manager.get_blocks())
+        
+        with self.connection_lock:
+            for peer_id, conn in self.connections.items():
+                try:
+                    conn.send_have_blocks(our_blocks)
+                except Exception as e:
+                    self.logger.error(f"Erro ao enviar HAVE_BLOCKS para {peer_id}: {str(e)}")
+    
+    def _handle_download_completion(self) -> None:
+        """
+        Processa a conclusão do download, reconstruindo o arquivo.
+        """
+        if self.completed:
+            return
+            
+        try:
+            # Marcar como completo
+            self.completed = True
+            
+            # Obter informações do torrent
+            file_name = self.torrent_info.get("file_name", "downloaded_file")
+            output_path = os.path.join(self.download_dir, file_name)
+            
+            # Reconstruir o arquivo
+            self.block_manager.reconstruct_file(output_path)
+            
+            self.logger.info(f"Download completo! Arquivo salvo em: {output_path}")
+            
+            # Notificar o tracker (em uma implementação real)
+            
+        except Exception as e:
+            self.completed = False
+            self.logger.error(f"Erro ao finalizar download: {str(e)}")
+    
+    def _log_status(self) -> None:
+        """
+        Registra o status atual do download no log.
+        """
+        if not hasattr(self, 'torrent_info') or not self.torrent_info:
+            return
+            
+        status = self.get_download_status()
+        
+        self.logger.info(
+            f"Status: {status['status']} | "
+            f"Progresso: {status['progress']:.1f}% | "
+            f"{status['downloaded_blocks']}/{status['total_blocks']} blocos | "
+            f"Conexões: {status['active_connections']}"
+        )

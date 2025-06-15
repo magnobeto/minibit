@@ -7,9 +7,9 @@ import threading
 import uuid
 from typing import Dict, List, Set, Tuple, Optional, Any
 
-from block_manager import BlockManager
-from peer_connection import PeerConnection
-from unchoke_manager import UnchokeManager
+from peer.block_manager import BlockManager
+from peer.peer_connection import PeerConnection
+from peer.unchoke_manager import UnchokeManager
 
 class Peer:
     """
@@ -568,7 +568,7 @@ class Peer:
             # Supondo que o tracker retorne uma lista de peers ativos
             tracker_response = {
                 "peers": [
-                    {"id": f"peer_{i}", "host": "localhost", "port": 9000+i}
+                    {"id": f"peer_{i}", "host": "127.0.0.1", "port": 9000+i}
                     for i in range(1, 5)
                 ]
             }

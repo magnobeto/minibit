@@ -47,15 +47,6 @@ def create_socket(port: int = 0) -> tuple[socket.socket, int]:
     sock.listen(5)
     return sock, sock.getsockname()[1]
 
-def create_unique_socket() -> tuple[socket.socket, int]:
-    """Creates a socket with a guaranteed unique port"""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(('127.0.0.1', 0))
-    sock.listen(5)  # Start listening immediately
-    return sock, sock.getsockname()[1]
-
-
 def handle_client(client_socket, block_manager):
     # Aqui você pode implementar a lógica de comunicação com o cliente
     try:

@@ -30,3 +30,15 @@ Abra um terminal e execute:
 ```bash
 python main.py tracker
 ```
+
+Para criar os Seeders:
+
+```bash
+python main.py peer --file-path arquivo_teste.txt
+```
+
+Para criar os Leechers:
+
+```bash
+python main.py peer --file-name arquivo_teste.txt
+```

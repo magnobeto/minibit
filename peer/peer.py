@@ -24,7 +24,7 @@ class Peer:
     STATUS_UPDATE_INTERVAL = 5.0  # segundos
     
     def __init__(self, 
-                 connection: Union[Tuple[str, int], socket.socket], 
+                 socket_or_port: Union[socket.socket, Tuple[str, int]], 
                  block_manager: Optional['BlockManager'] = None,
                  download_dir: str = "downloads"):
         """
@@ -37,21 +37,21 @@ class Peer:
         """
         # Identificador único para este peer
         self.id = str(uuid.uuid4())[:8]
+        self.running = False
+        self.logger = logging.getLogger(f"Peer-{self.id}")
+        
+        # Handle socket initialization
+        if isinstance(socket_or_port, socket.socket):
+            self.server_socket = socket_or_port
+            self.listen_port = self.server_socket.getsockname()[1]
+        else:
+            self.server_socket = None
+            self.listen_port = socket_or_port[1]
+        
         self.block_manager = block_manager
         self.download_dir = download_dir
         
-        # Configura socket e porta
-        if isinstance(connection, socket.socket):
-            self.socket = connection
-            self.listen_port = connection.getsockname()[1]
-        elif isinstance(connection, tuple):
-            self.listen_port = connection[1]
-            self.socket = None
-        else:
-            raise ValueError("connection deve ser socket ou tupla (host, porta)")
-            
         # Estado interno
-        self.running = False
         self.completed = False
         self.peers: Dict[str, Dict[str, Any]] = {}  # Informações sobre peers conhecidos
         self.connections: Dict[str, PeerConnection] = {}  # Conexões ativas
@@ -105,54 +105,29 @@ class Peer:
         
         return logger
     
-    def start(self, torrent_info: Dict[str, Any] = None) -> bool:
-        """
-        Inicia o peer, conectando ao tracker e começando a servir/baixar conteúdo.
-        
-        Args:
-            torrent_info: Informações sobre o torrent a ser baixado
-                         (None se apenas for iniciar o peer)
-        
-        Returns:
-            True se o peer foi iniciado com sucesso, False caso contrário
-        """
+    def start(self) -> None:
+        """Starts the peer server"""
         if self.running:
-            self.logger.warning("Peer já está em execução.")
-            return False
+            return
+            
+        self.running = True
         
-        try:
-            self.running = True
-            
-            # Iniciar o servidor para aceitar conexões
-            self.server_thread = threading.Thread(target=self._run_server)
-            self.server_thread.daemon = True
-            self.server_thread.start()
-            
-            # Se temos informações do torrent, iniciar o download
-            if torrent_info:
-                success = self._initialize_download(torrent_info)
-                if not success:
-                    self.logger.error("Falha ao inicializar download.")
-                    self.stop()
-                    return False
-            
-            # Iniciar thread para comunicação com o tracker
-            self.tracker_thread = threading.Thread(target=self._tracker_communication_loop)
-            self.tracker_thread.daemon = True
-            self.tracker_thread.start()
-            
-            # Iniciar thread para gerenciamento de conexões e downloads
-            self.client_thread = threading.Thread(target=self._client_loop)
-            self.client_thread.daemon = True
-            self.client_thread.start()
-            
-            self.logger.info(f"Peer iniciado com sucesso. ID: {self.id}, Porta: {self.listen_port}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Erro ao iniciar peer: {str(e)}")
-            self.running = False
-            return False
+        # Only create socket if not provided in constructor
+        if not self.server_socket:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                self.server_socket.bind(('127.0.0.1', self.listen_port))
+            except OSError as e:
+                self.logger.error(f"Failed to bind to port {self.listen_port}: {e}")
+                self.running = False
+                return
+                
+        self.server_socket.listen(5)
+        self.logger.info(f"Peer iniciado com sucesso. ID: {self.id}, Porta: {self.listen_port}")
+        
+        # Start server thread
+        threading.Thread(target=self._run_server, daemon=True).start()
     
     def stop(self) -> None:
         """

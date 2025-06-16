@@ -4,6 +4,7 @@ import threading
 import pickle
 import time
 import uuid
+import logging
 
 from peer.peer import Peer
 from peer.block_manager import BlockManager
@@ -44,6 +45,14 @@ def create_socket(port: int = 0) -> tuple[socket.socket, int]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(('127.0.0.1', port))
     sock.listen(5)
+    return sock, sock.getsockname()[1]
+
+def create_unique_socket() -> tuple[socket.socket, int]:
+    """Creates a socket with a guaranteed unique port"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(('127.0.0.1', 0))
+    sock.listen(5)  # Start listening immediately
     return sock, sock.getsockname()[1]
 
 def run_peer(connection_info, block_manager):
@@ -102,5 +111,36 @@ def request_loop(peer_id, block_manager):
             except Exception as e:
                 print(f"Erro ao conectar com {pid}@{ip}:{port} — {e}")
 
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+    
+    try:
+        # Create socket with unique port
+        server_socket, port = create_unique_socket()
+        logger.info(f"Created socket on port {port}")
+        
+        # Initialize peer with socket and port tuple
+        block_manager = BlockManager()
+        peer = Peer((server_socket, port), block_manager)
+        
+        # Start peer
+        peer.start()
+        
+        # Keep alive until interrupted
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Shutting down...")
+            peer.stop()
+    except Exception as e:
+        logger.error(f"Fatal error: {str(e)}")
+        raise
+
 if __name__ == "__main__":
     start_peer()
+    main()

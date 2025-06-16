@@ -39,24 +39,37 @@ def update_blocks(peer_id, blocks):
         s.sendall(pickle.dumps(msg))
         return pickle.loads(s.recv(8192)).get('status') == 'ok'
 
-def peer_worker(connection, addr, block_manager):
-    peer = Peer(connection, block_manager)
-    peer.start()
+def create_socket(port: int = 0) -> tuple[socket.socket, int]:
+    """Creates and returns a configured socket and its port"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(('127.0.0.1', port))
+    sock.listen(5)
+    return sock, sock.getsockname()[1]
+
+def run_peer(connection_info, block_manager):
+    """
+    Runs a peer instance
+    Args:
+        connection_info: Tuple of (host, port) or socket object
+        block_manager: BlockManager instance
+    """
+    try:
+        peer = Peer(connection_info, block_manager)
+        peer.start()
+    except Exception as e:
+        print(f"Peer error: {e}")
 
 def start_peer():
     peer_id = str(uuid.uuid4())[:8]
     block_manager = BlockManager()
     
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.bind(('127.0.0.1', LISTEN_PORT))
-    listener.listen()
-    ip, port = listener.getsockname()
-    print(f"[{peer_id}] Escutando em {ip}:{port}")
+    server_socket, port = create_socket(LISTEN_PORT)
+    print(f"[{peer_id}] Escutando em 127.0.0.1:{port}")
 
-    peers = register_with_tracker(peer_id, ip, port, block_manager.blocks)
+    peers = register_with_tracker(peer_id, '127.0.0.1', port, block_manager.blocks)
     print(f"[{peer_id}] Peers recebidos: {peers}")
 
-    threading.Thread(target=lambda: accept_loop(listener, block_manager), daemon=True).start()
+    threading.Thread(target=lambda: accept_loop(server_socket, block_manager), daemon=True).start()
     threading.Thread(target=lambda: request_loop(peer_id, block_manager), daemon=True).start()
 
     try:
@@ -68,12 +81,12 @@ def start_peer():
         with socket.socket() as s:
             s.connect((TRACKER_HOST, TRACKER_PORT))
             s.sendall(pickle.dumps(msg))
-        listener.close()
+        server_socket.close()
 
-def accept_loop(listener, block_manager):
+def accept_loop(server_socket, block_manager):
     while True:
-        conn, addr = listener.accept()
-        threading.Thread(target=peer_worker, args=(conn, addr, block_manager), daemon=True).start()
+        client_socket, addr = server_socket.accept()
+        threading.Thread(target=run_peer, args=(client_socket, block_manager), daemon=True).start()
 
 def request_loop(peer_id, block_manager):
     while True:

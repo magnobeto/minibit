@@ -5,7 +5,8 @@ import random
 import logging
 import threading
 import uuid
-from typing import Dict, List, Set, Tuple, Optional, Any
+from typing import Dict, List, Set, Tuple, Optional, Any, Union
+import json
 
 from peer.block_manager import BlockManager
 from peer.peer_connection import PeerConnection
@@ -22,26 +23,33 @@ class Peer:
     BLOCK_REQUEST_INTERVAL = 0.5  # segundos
     STATUS_UPDATE_INTERVAL = 5.0  # segundos
     
-    def __init__(self, listen_port: int, tracker_address: Tuple[str, int], 
+    def __init__(self, 
+                 connection: Union[Tuple[str, int], socket.socket], 
+                 block_manager: Optional['BlockManager'] = None,
                  download_dir: str = "downloads"):
         """
         Inicializa um novo peer na rede.
         
         Args:
-            listen_port: Porta para aceitar conexões de outros peers
-            tracker_address: Endereço do tracker (host, porta)
-            download_dir: Diretório para salvar os arquivos baixados
+            connection: Tupla (host, porta) ou socket já conectado
+            block_manager: Gerenciador de blocos para download/upload
+            download_dir: Diretório para downloads
         """
         # Identificador único para este peer
         self.id = str(uuid.uuid4())[:8]
-        self.listen_port = listen_port
-        self.tracker_address = tracker_address
+        self.block_manager = block_manager
         self.download_dir = download_dir
         
-        # Gerenciadores de componentes
-        self.block_manager = BlockManager()
-        self.unchoke_manager = UnchokeManager()
-        
+        # Configura socket e porta
+        if isinstance(connection, socket.socket):
+            self.socket = connection
+            self.listen_port = connection.getsockname()[1]
+        elif isinstance(connection, tuple):
+            self.listen_port = connection[1]
+            self.socket = None
+        else:
+            raise ValueError("connection deve ser socket ou tupla (host, porta)")
+            
         # Estado interno
         self.running = False
         self.completed = False
@@ -62,6 +70,12 @@ class Peer:
         
         # Garantir que o diretório de downloads existe
         os.makedirs(download_dir, exist_ok=True)
+        
+        # Initialize unchoke manager
+        self.unchoke_manager = UnchokeManager(self)
+        
+        # Track if server is already running
+        self.server_running = False
     
     def _setup_logger(self) -> logging.Logger:
         """
@@ -294,41 +308,44 @@ class Peer:
             return False
     
     def _run_server(self) -> None:
-        """
-        Thread que aceita conexões de outros peers.
-        """
+        """Executa o servidor para aceitar conexões de outros peers."""
+        # Check if server is already running
+        if self.server_running:
+            self.logger.warning("Server already running")
+            return
+
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Add socket reuse option
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
         try:
-            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.bind(('', self.listen_port))
-            server_socket.settimeout(1.0)  # Timeout para permitir verificação de self.running
+            server_socket.bind(('127.0.0.1', self.listen_port))
             server_socket.listen(5)
+            self.server_running = True
             
-            self.logger.info(f"Servidor iniciado na porta {self.listen_port}")
+            # Store actual port after binding
+            self.actual_port = server_socket.getsockname()[1]
+            self.logger.info(f"Peer iniciado com sucesso. ID: {self.id}, Porta: {self.actual_port}")
             
             while self.running:
                 try:
                     client_socket, address = server_socket.accept()
-                    client_thread = threading.Thread(
+                    thread = threading.Thread(
                         target=self._handle_incoming_connection,
                         args=(client_socket, address)
                     )
-                    client_thread.daemon = True
-                    client_thread.start()
-                except socket.timeout:
-                    continue
+                    thread.daemon = True
+                    thread.start()
                 except Exception as e:
-                    if self.running:
-                        self.logger.error(f"Erro no servidor: {str(e)}")
-            
+                    self.logger.error(f"Erro ao aceitar conexão: {str(e)}")
+                    if not self.running:
+                        break
         except Exception as e:
             self.logger.error(f"Erro fatal no servidor: {str(e)}")
         finally:
-            try:
-                server_socket.close()
-            except:
-                pass
-    
+            self.server_running = False
+            server_socket.close()
+
     def _handle_incoming_connection(self, client_socket: socket.socket, address: Tuple[str, int]) -> None:
         """
         Processa uma nova conexão de entrada.
@@ -673,6 +690,28 @@ class Peer:
             
         except Exception as e:
             self.logger.error(f"Erro ao conectar ao peer {peer_id}: {str(e)}")
+            return False
+    
+    def request_missing_blocks(self):
+        """Solicita blocos faltantes do peer."""
+        if not self.block_manager:
+            return
+            
+        missing_blocks = self.block_manager.get_missing_blocks()
+        for block_id in missing_blocks:
+            self.send_request(block_id)
+            
+    def send_request(self, block_id):
+        """Envia requisição de bloco para o peer."""
+        if not self.socket:
+            return False
+        try:
+            # Implementar lógica de envio de requisição
+            message = {'type': 'request', 'block_id': block_id}
+            self.socket.send(json.dumps(message).encode())
+            return True
+        except Exception as e:
+            self.logger.error(f"Erro ao enviar requisição: {e}")
             return False
     
     def _request_missing_blocks(self) -> None:

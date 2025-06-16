@@ -6,11 +6,9 @@ import logging
 import threading
 import uuid
 from typing import Dict, List, Set, Tuple, Optional, Any, Union
-import json
-
+from peer.peer_helper import PeerHelper
 from peer.block_manager import BlockManager
 from peer.peer_connection import PeerConnection
-from peer.unchoke_manager import UnchokeManager
 from utils.logging_utils import setup_peer_logger
 from utils.file_utils import ensure_download_dir
 
@@ -26,8 +24,8 @@ class Peer:
     STATUS_UPDATE_INTERVAL = 5.0  # segundos
     
     def __init__(self, 
-                 socket_or_port: Union[socket.socket, Tuple[str, int]], 
-                 block_manager: Optional['BlockManager'] = None,
+                 socket_or_port, 
+                 block_manager: Optional[BlockManager] = None,
                  download_dir: str = "downloads"):
         """
         Inicializa um novo peer na rede.
@@ -39,43 +37,30 @@ class Peer:
         """
         # Identificador único para este peer
         self.id = str(uuid.uuid4())[:8]
-        self.running = False
         self.logger = setup_peer_logger(self.id)
+        self.block_manager = block_manager or BlockManager()
+        self.helper = PeerHelper(self.logger, self.block_manager)
         
-        # Handle socket initialization
+        self.server_socket = None
+        self.listen_port = None  # Add this attribute
+        self.running = False
+        
+        # Garantir que o diretório de downloads existe
+        ensure_download_dir(download_dir)
+        self._setup_server(socket_or_port)
+
+    def _setup_server(self, socket_or_port) -> None:
+        """Setup server socket"""
         if isinstance(socket_or_port, socket.socket):
             self.server_socket = socket_or_port
             self.listen_port = self.server_socket.getsockname()[1]
         else:
-            self.server_socket = None
-            self.listen_port = socket_or_port[1]
-        
-        self.block_manager = block_manager
-        self.download_dir = download_dir
-        
-        # Estado interno
-        self.completed = False
-        self.peers: Dict[str, Dict[str, Any]] = {}  # Informações sobre peers conhecidos
-        self.connections: Dict[str, PeerConnection] = {}  # Conexões ativas
-        
-        # Threads
-        self.server_thread: Optional[threading.Thread] = None
-        self.client_thread: Optional[threading.Thread] = None
-        self.tracker_thread: Optional[threading.Thread] = None
-        
-        # Locks para acesso thread-safe
-        self.peers_lock = threading.Lock()
-        self.connection_lock = threading.Lock()
-        
-        # Garantir que o diretório de downloads existe
-        ensure_download_dir(download_dir)
-        
-        # Initialize unchoke manager
-        self.unchoke_manager = UnchokeManager()
-        
-        # Track if server is already running
-        self.server_running = False
-    
+            self.listen_port = int(socket_or_port)
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind(('127.0.0.1', self.listen_port))
+            self.server_socket.listen(5)
+
     def start(self) -> None:
         """Starts the peer server"""
         if self.running:
@@ -292,7 +277,8 @@ class Peer:
             self.server_running = False
             server_socket.close()
 
-    def _handle_incoming_connection(self, client_socket: socket.socket, address: Tuple[str, int]) -> None:
+    def _handle_incoming_connection(self, client_socket: socket.socket, 
+                                  address: Tuple[str, int]) -> None:
         """
         Processa uma nova conexão de entrada.
         
@@ -368,6 +354,9 @@ class Peer:
             
             # Atualizar informações de raridade no block manager
             self.block_manager.update_rarity_info(peer_id, available_blocks)
+            
+            # Handle new peer connection in helper
+            self.helper.handle_peer_connection(peer_id, peer_addr, available_blocks, peer_conn)
             
             # Loop de processamento de mensagens
             self._process_peer_messages(peer_conn, peer_id)
@@ -750,15 +739,12 @@ class Peer:
         Args:
             block_id: ID do bloco adicionado
         """
-        our_blocks = list(self.block_manager.get_blocks())
-        
-        with self.connection_lock:
-            for peer_id, conn in self.connections.items():
-                try:
-                    conn.send_have_blocks(our_blocks)
-                except Exception as e:
-                    self.logger.error(f"Erro ao enviar HAVE_BLOCKS para {peer_id}: {str(e)}")
-    
+        blocks = list(self.block_manager.get_blocks())
+        self.helper.broadcast_message(
+            PeerConnection.MSG_HAVE_BLOCKS,
+            {"blocks": blocks}
+        )
+
     def _handle_download_completion(self) -> None:
         """
         Processa a conclusão do download, reconstruindo o arquivo.

@@ -11,6 +11,8 @@ import json
 from peer.block_manager import BlockManager
 from peer.peer_connection import PeerConnection
 from peer.unchoke_manager import UnchokeManager
+from utils.logging_utils import setup_peer_logger
+from utils.file_utils import ensure_download_dir
 
 class Peer:
     """
@@ -38,7 +40,7 @@ class Peer:
         # Identificador único para este peer
         self.id = str(uuid.uuid4())[:8]
         self.running = False
-        self.logger = logging.getLogger(f"Peer-{self.id}")
+        self.logger = setup_peer_logger(self.id)
         
         # Handle socket initialization
         if isinstance(socket_or_port, socket.socket):
@@ -65,45 +67,14 @@ class Peer:
         self.peers_lock = threading.Lock()
         self.connection_lock = threading.Lock()
         
-        # Configuração de logging
-        self.logger = self._setup_logger()
-        
         # Garantir que o diretório de downloads existe
-        os.makedirs(download_dir, exist_ok=True)
+        ensure_download_dir(download_dir)
         
         # Initialize unchoke manager
         self.unchoke_manager = UnchokeManager()
         
         # Track if server is already running
         self.server_running = False
-    
-    def _setup_logger(self) -> logging.Logger:
-        """
-        Configura o logger para o peer.
-        
-        Returns:
-            Instância configurada do logger
-        """
-        logger = logging.getLogger(f"Peer-{self.id}")
-        logger.setLevel(logging.INFO)
-        
-        # Evitar duplicação de handlers
-        if not logger.handlers:
-            # Handler para saída no console
-            console_handler = logging.StreamHandler()
-            console_handler.setFormatter(
-                logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            )
-            logger.addHandler(console_handler)
-            
-            # Handler para saída em arquivo
-            file_handler = logging.FileHandler(f"peer-{self.id}.log")
-            file_handler.setFormatter(
-                logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-            )
-            logger.addHandler(file_handler)
-        
-        return logger
     
     def start(self) -> None:
         """Starts the peer server"""

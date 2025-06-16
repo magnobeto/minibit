@@ -104,18 +104,16 @@ def request_loop(peer_id, block_manager):
             try:
                 with socket.socket() as s:
                     s.connect((ip, port))
-                    # Aqui você implementa a lógica de requisição de blocos diretamente pelo socket
-                    # Por exemplo:
-                    # s.sendall(b"GET_BLOCKS")
-                    # resposta = s.recv(4096)
-                    # processa a resposta e salva os blocos no block_manager
-                    # update_blocks(peer_id, block_manager.blocks)
-                    # Exemplo fictício:
-                    # missing_blocks = block_manager.get_missing_blocks(their_blocks)
-                    # for block_id in missing_blocks:
-                    #     s.sendall(f"GET {block_id}".encode())
-                    #     data = s.recv(4096)
-                    #     block_manager.save_block(block_id, data)
+                    # Descobre quais blocos faltam
+                    missing_blocks = set(their_blocks) - set(block_manager.blocks)
+                    for block_id in missing_blocks:
+                        # Solicita o bloco
+                        s.sendall(f"GET_BLOCK {block_id}\n".encode())
+                        # Recebe o bloco (simples, sem controle de tamanho)
+                        data = s.recv(65536)
+                        if data:
+                            block_manager.save_block(block_id, data)
+                    # Atualiza o tracker com os blocos recebidos
                     update_blocks(peer_id, block_manager.blocks)
             except Exception as e:
                 print(f"Erro ao conectar com {pid}@{ip}:{port} — {e}")

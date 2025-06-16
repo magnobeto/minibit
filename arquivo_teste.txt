@@ -1,0 +1,12 @@
+Este é um arquivo de teste para o projeto MiniBit.
+Seu objetivo é ser dividido em blocos, compartilhado através da rede P2P
+e reconstruído perfeitamente pelos peers que o baixarem.
+
+O sistema deve implementar as estratégias "rarest first" e "tit-for-tat"
+para otimizar a distribuição dos blocos.
+
+Linha 1.
+Linha 2.
+Linha 3.
+...
+Fim do arquivo de teste.

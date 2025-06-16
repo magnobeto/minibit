@@ -24,7 +24,7 @@ class Peer:
     STATUS_UPDATE_INTERVAL = 5.0  # segundos
     
     def __init__(self, 
-                 socket_or_port, 
+                 port: int = 0, 
                  block_manager: Optional[BlockManager] = None,
                  download_dir: str = "downloads"):
         """
@@ -35,6 +35,9 @@ class Peer:
             block_manager: Gerenciador de blocos para download/upload
             download_dir: Diretório para downloads
         """
+        if not isinstance(port, int):
+            raise ValueError(f"Port precisa ser inteiro, recebido: {type(port)}")
+        
         # Identificador único para este peer
         self.id = str(uuid.uuid4())[:8]
         self.logger = setup_peer_logger(self.id)
@@ -47,19 +50,27 @@ class Peer:
         
         # Garantir que o diretório de downloads existe
         ensure_download_dir(download_dir)
-        self._setup_server(socket_or_port)
+        self._setup_server(port)
 
-    def _setup_server(self, socket_or_port) -> None:
+    def _setup_server(self, port) -> None:
         """Setup server socket"""
-        if isinstance(socket_or_port, socket.socket):
-            self.server_socket = socket_or_port
-            self.listen_port = self.server_socket.getsockname()[1]
-        else:
-            self.listen_port = int(socket_or_port)
+        try:
+            # Create new socket
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.bind(('127.0.0.1', self.listen_port))
+            
+            # Bind to address
+            self.server_socket.bind(('127.0.0.1', port))
             self.server_socket.listen(5)
+            
+            # Update port if it was auto-assigned
+            self.listen_port = self.server_socket.getsockname()[1]
+            
+        except Exception as e:
+            self.logger.error(f"Socket initialization failed: {e}")
+            if hasattr(self, 'server_socket'):
+                self.server_socket.close()
+            raise
 
     def start(self) -> None:
         """Starts the peer server"""
@@ -786,3 +797,50 @@ class Peer:
             f"{status['downloaded_blocks']}/{status['total_blocks']} blocos | "
             f"Conexões: {status['active_connections']}"
         )
+
+    def connect_to_peer(self, peer_id: str, host: str, port: int) -> bool:
+        """
+        Connect to a peer with retry mechanism
+        Returns: True if connection successful, False otherwise
+        """
+        MAX_RETRIES = 3
+        RETRY_DELAY = 1  # seconds
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                # Create new connection
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5)  # 5 second timeout
+                sock.connect((host, port))
+                
+                # Store connection if successful
+                with self.peers_lock:
+                    self.peers[peer_id] = {
+                        'socket': sock,
+                        'address': (host, port),
+                        'connected': True
+                    }
+                
+                self.logger.info(f"Connected to peer {peer_id} at {host}:{port}")
+                return True
+                
+            except (socket.timeout, ConnectionRefusedError) as e:
+                if attempt < MAX_RETRIES - 1:
+                    self.logger.warning(f"Connection attempt {attempt + 1} failed, retrying...")
+                    time.sleep(RETRY_DELAY)
+                else:
+                    self.logger.error(f"Failed to connect to {peer_id}@{host}:{port} after {MAX_RETRIES} attempts")
+                    return False
+            except Exception as e:
+                self.logger.error(f"Unexpected error connecting to {peer_id}: {e}")
+                return False
+
+    def _handle_peer_list(self, peers_info: list) -> None:
+        """Handle received peer list with connection retry"""
+        for peer_id, host, port, _ in peers_info:
+            if peer_id != self.id and peer_id not in self.peers:
+                threading.Thread(
+                    target=self.connect_to_peer,
+                    args=(peer_id, host, port),
+                    daemon=True
+                ).start()

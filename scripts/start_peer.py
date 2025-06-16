@@ -55,18 +55,17 @@ def create_unique_socket() -> tuple[socket.socket, int]:
     sock.listen(5)  # Start listening immediately
     return sock, sock.getsockname()[1]
 
-def run_peer(connection_info, block_manager):
-    """
-    Runs a peer instance
-    Args:
-        connection_info: Tuple of (host, port) or socket object
-        block_manager: BlockManager instance
-    """
+
+def handle_client(client_socket, block_manager):
+    # Aqui você pode implementar a lógica de comunicação com o cliente
     try:
-        peer = Peer(connection_info, block_manager)
-        peer.start()
+        data = client_socket.recv(1024)
+        # Trate os dados recebidos conforme necessário
+        # ...
     except Exception as e:
-        print(f"Peer error: {e}")
+        print(f"Erro no cliente: {e}")
+    finally:
+        client_socket.close()
 
 def start_peer():
     peer_id = str(uuid.uuid4())[:8]
@@ -95,7 +94,7 @@ def start_peer():
 def accept_loop(server_socket, block_manager):
     while True:
         client_socket, addr = server_socket.accept()
-        threading.Thread(target=run_peer, args=(client_socket, block_manager), daemon=True).start()
+        threading.Thread(target=handle_client, args=(client_socket, block_manager), daemon=True).start()
 
 def request_loop(peer_id, block_manager):
     while True:
@@ -105,41 +104,40 @@ def request_loop(peer_id, block_manager):
             try:
                 with socket.socket() as s:
                     s.connect((ip, port))
-                    peer = Peer(s)
-                    peer.request_missing_blocks()
+                    # Aqui você implementa a lógica de requisição de blocos diretamente pelo socket
+                    # Por exemplo:
+                    # s.sendall(b"GET_BLOCKS")
+                    # resposta = s.recv(4096)
+                    # processa a resposta e salva os blocos no block_manager
+                    # update_blocks(peer_id, block_manager.blocks)
+                    # Exemplo fictício:
+                    # missing_blocks = block_manager.get_missing_blocks(their_blocks)
+                    # for block_id in missing_blocks:
+                    #     s.sendall(f"GET {block_id}".encode())
+                    #     data = s.recv(4096)
+                    #     block_manager.save_block(block_id, data)
                     update_blocks(peer_id, block_manager.blocks)
             except Exception as e:
                 print(f"Erro ao conectar com {pid}@{ip}:{port} — {e}")
 
 def main():
+    # Setup logging
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        format='%(asctime)s - %(levelname)s - %(message)s'
     )
-    logger = logging.getLogger(__name__)
     
     try:
-        # Create socket with unique port
-        server_socket, port = create_unique_socket()
-        logger.info(f"Created socket on port {port}")
-        
-        # Initialize peer with socket and port tuple
         block_manager = BlockManager()
-        peer = Peer((server_socket, port), block_manager)
-        
-        # Start peer
+        # Usa port=0 para atribuição automática (um inteiro)
+        peer = Peer(port=0, block_manager=block_manager)
         peer.start()
-        
-        # Keep alive until interrupted
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            logger.info("Shutting down...")
-            peer.stop()
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        peer.stop()
     except Exception as e:
-        logger.error(f"Fatal error: {str(e)}")
-        raise
+        logging.error(f"Error: {e}")
 
 if __name__ == "__main__":
     start_peer()

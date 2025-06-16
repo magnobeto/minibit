@@ -72,7 +72,7 @@ class Peer:
         os.makedirs(download_dir, exist_ok=True)
         
         # Initialize unchoke manager
-        self.unchoke_manager = UnchokeManager(self)
+        self.unchoke_manager = UnchokeManager()
         
         # Track if server is already running
         self.server_running = False

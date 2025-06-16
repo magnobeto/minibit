@@ -96,7 +96,7 @@ def request_loop(peer_id, block_manager):
             try:
                 with socket.socket() as s:
                     s.connect((ip, port))
-                    peer = Peer(listen_port= s.getsockname()[1], tracker_address=(ip, port))
+                    peer = Peer(s)
                     peer.request_missing_blocks()
                     update_blocks(peer_id, block_manager.blocks)
             except Exception as e:

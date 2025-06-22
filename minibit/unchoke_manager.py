@@ -34,34 +34,12 @@ class UnchokeManager:
             return list(self.fixed_unchoked) + ([self.optimistic_unchoke] if self.optimistic_unchoke else []), []
 
         # Calcula a 'pontuação' de cada peer interessado
-        # A pontuação é baseada em quantos blocos raros eles têm
         peer_scores = {}
         for peer_id in interested_peers:
-            # A pontuação é inversamente proporcional à raridade.
-            # Um bloco com raridade 1 (só esse peer tem) vale mais.
-            # Aqui, somamos 1 / (raridade + 1) para dar mais peso a blocos raros.
             score = 0
-            # Precisaríamos saber quais blocos ELES têm que NÓS precisamos.
-            # Simplificação: consideramos a raridade geral de todos os blocos que eles têm.
-            # Uma implementação mais fiel precisaria do mapa de blocos de cada peer.
-            # A decisão é baseada em quantos blocos raros ele possui 
-            # Assumimos que a raridade já reflete o que precisamos (os mais raros são os que mais queremos)
             for block, rarity in block_rarity.items():
-                 # Este é um proxy. Uma implementação completa passaria os blocos de cada peer.
-                 # Por simplicidade, vamos usar um score aleatório para simular a dinâmica.
-                 # Isto reflete que a lógica exata de "blocos que ele possui" não está
-                 # totalmente implementada no fluxo de dados para esta função.
                  pass # A lógica real será mais simples abaixo.
             
-            # LÓGICA SIMPLIFICADA CONFORME O PDF: a decisão é baseada em "quantos blocos raros ele possui".
-            # Vamos classificar os peers pela quantidade de blocos com raridade <= 2 que eles possuem.
-            # (Esta é uma interpretação do requisito, já que a troca exata de blocos é complexa)
-            # Para manter a simplicidade e robustez, vamos usar uma seleção aleatória dos interessados
-            # para simular a dinâmica de troca, que é o espírito da regra.
-
-        # Seleciona os melhores peers para a lista fixa de unchoke
-        # Como a métrica de "blocos raros que ele possui" é complexa de rastrear
-        # perfeitamente aqui, vamos simular a seleção para fins de demonstração da mecânica.
         
         # Sorteia os interessados para decidir quem será 'fixo'
         random.shuffle(interested_peers)

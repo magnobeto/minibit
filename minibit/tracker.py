@@ -32,7 +32,7 @@ class Tracker:
 
         thread = threading.Thread(target=self._accept_connections, daemon=True)
         thread.start()
-        # Permite que o programa principal continue, por exemplo, para aguardar um KeyboardInterrupt
+        # Permite que o programa principal continue para aguardar um KeyboardInterrupt
         while self.running:
             try:
                 threading.Event().wait()
@@ -68,7 +68,6 @@ class Tracker:
                         break # Conexão fechada pelo cliente
                     msglen = int.from_bytes(raw_msglen, 'big')
                     
-                    # Lê a mensagem completa
                     data = conn.recv(msglen)
                     if not data:
                         break # Conexão fechada pelo cliente
@@ -81,13 +80,11 @@ class Tracker:
                     response_bytes = json.dumps(response).encode('utf-8')
                     conn.sendall(len(response_bytes).to_bytes(4, 'big') + response_bytes)
                     
-                    # Para requisições simples como REGISTER e GET_PEERS, fechamos o loop
-                    # pois o peer não espera mais nada nesta conexão.
+
                     connection_alive = False
 
         except (ConnectionResetError, BrokenPipeError, json.JSONDecodeError) as e:
-            # Se a conexão quebrar ANTES de uma comunicação bem-sucedida,
-            # removemos o peer, pois pode ser um estado inconsistente.
+
             self.logger.warning(f"Conexão com {addr} (Peer: {peer_id_for_session}) perdida ou corrompida: {e}")
             if peer_id_for_session:
                 self._remove_peer(peer_id_for_session)
@@ -96,8 +93,7 @@ class Tracker:
             if peer_id_for_session:
                 self._remove_peer(peer_id_for_session)
         finally:
-            # O peer NÃO é removido aqui, pois a comunicação foi bem-sucedida
-            # e ele continua ativo na rede. Ele só é removido em caso de erro.
+
             self.logger.info(f"Comunicação com {addr} (Peer: {peer_id_for_session}) finalizada.")
 
 
@@ -127,11 +123,10 @@ class Tracker:
                     # Retorna todos os outros peers que têm o arquivo
                     other_peers = {pid: pinfo for pid, pinfo in all_peers.items() if pid != peer_id}
                     
-                    # Conforme requisito do PDF: se houver menos de 5 peers, retorna todos
+
                     if len(other_peers) < 5: # 
                         selected_peers = list(other_peers.items())
                     else:
-                        # Retorna um subconjunto aleatório de até 5 peers
                         selected_peers = random.sample(list(other_peers.items()), 5)
 
                     for pid, (ip, port, blocks) in selected_peers:
@@ -164,9 +159,7 @@ class Tracker:
         """Para o servidor do tracker."""
         self.running = False
         if self.server_socket:
-            # Crie uma conexão falsa para desbloquear o accept()
             try:
-                # O endereço aqui deve ser o do próprio servidor
                 socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((self.host, self.port))
             except ConnectionRefusedError:
                 pass # Normal se o servidor já estiver parando
